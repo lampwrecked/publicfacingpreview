@@ -11,9 +11,12 @@
 <meta property="og:url" content="https://publicfacingpreview.lampwrecked.art/">
 <meta name="twitter:card" content="summary_large_image">
 
+<!-- Trait images come from R2; open the connection before the script asks for them -->
+<link rel="preconnect" href="https://pub-3e06ecff65d04bde885d3d4485d0c630.r2.dev" crossorigin>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,400&family=EB+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
+<!-- Only the weights the page uses: Cormorant 400, EB Garamond 400 + italic -->
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400&family=EB+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
 
 <style>
   /* Palette pulled from publicfacing.vercel.app */
@@ -60,9 +63,6 @@
     aspect-ratio: 1 / 1;
     width: 100%;
     background-color: var(--window);
-    background-image: url('./splash.jpg');
-    background-size: cover;
-    background-position: center;
     overflow: hidden;
   }
 
@@ -73,8 +73,9 @@
     height: 100%;
     object-fit: cover;
     display: block;
-    will-change: opacity;
   }
+  /* Hidden until its first image has arrived, so nothing flashes a broken-image icon */
+  .layer:not([src]) { visibility: hidden; }
 
   /* Ghost layers render at 30% opacity for a translucent overlay effect */
   .layer[data-layer="Ghost 1"],
@@ -332,23 +333,46 @@
 
   const INTERVAL_MS = 1000;  // ms between full-face swaps
 
+  /* ============================================================
+     LOADING BUDGET
+     ----------------------------------------------------------------
+     The old loader fetched every trait for every layer (8 x 48 = 384
+     full-size PNGs) on every visit. This one:
+       - shows a face after ONE image per layer (8 requests)
+       - then grows each layer's pool a little at a time, a few
+         downloads in flight at once, so the first face isn't starved
+       - stops at POOL_TARGET per layer (plenty of variety; a visitor
+         would need minutes to notice repeats)
+       - pauses while the tab is hidden, and trims the target when the
+         visitor has asked for reduced data use
+     ============================================================ */
+  const saveData    = !!(navigator.connection && navigator.connection.saveData);
+  const POOL_TARGET = saveData ? 3 : 12;   // images per layer, max
+  const CONCURRENCY = 4;                   // downloads in flight at once
+
   /* ---------- build layer stack ---------- */
   const windowEl = document.getElementById("window");
-  const layerImgs = [];
-  const layerSources = [];   // every possible URL per layer
-  const loadedPool   = [];   // grows as images successfully load
+  const layerImgs  = [];
+  const loadedPool = [];   // per layer: URLs that have loaded (objects decoded)
+  const queue      = [];   // per layer: URLs still to try, shuffled
 
   TRAIT_LAYERS.forEach((layer, i) => {
     const img = document.createElement("img");
     img.className = "layer";
     img.alt = "";
+    img.decoding = "async";
     img.setAttribute("aria-hidden", "true");
     img.dataset.layer = layer.folder;
     windowEl.appendChild(img);
     layerImgs.push(img);
 
     const urls = TRAIT_NAMES.map(n => `${BASE}${encodeURIComponent(layer.folder)}/${n}${layer.suffix}.${EXT}`);
-    layerSources.push(urls);
+    // Fisher-Yates shuffle (the old sort(() => random) isn't a fair shuffle)
+    for (let a = urls.length - 1; a > 0; a--) {
+      const b = Math.floor(Math.random() * (a + 1));
+      [urls[a], urls[b]] = [urls[b], urls[a]];
+    }
+    queue.push(urls);
     loadedPool.push([]);
   });
 
@@ -360,47 +384,62 @@
     img.src = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>";
   }
 
-  /* ---------- prioritized preload ----------
-     Phase 1: load FIRST_WAVE random images per layer immediately so the
-              cycle can start almost instantly even on slow connections.
-     Phase 2: load the rest 2s later as background variety.
-     Placeholder only shows if EVERY request for a layer fails (i.e. the
-     folder is genuinely unreachable), not just because the connection
-     is slow.
-  */
-  const FIRST_WAVE = 3;
-  const layerCompleted = TRAIT_LAYERS.map(() => 0);
+  /* ---------- download queue ----------
+     Round-robins across layers so every layer gets its first image
+     before any layer gets its second. */
+  let inFlight = 0;
+  const pending = TRAIT_LAYERS.map(() => 0);   // in flight, per layer
+  const failed  = TRAIT_LAYERS.map(() => 0);
+  const MAX_FAILURES = 8;   // give up on a layer after this many misses in a row
 
-  function loadImage(url, i) {
-    const im = new Image();
-    im.onload  = () => {
-      loadedPool[i].push(url);
-      if (loadedPool[i].length === 1) layerImgs[i].src = url;
-      tallyCompleted(i);
-    };
-    im.onerror = () => tallyCompleted(i);
-    im.src = url;
+  function nextJob() {
+    // Prefer the layer with the fewest images loaded-or-loading that still has work to do
+    let best = -1, bestCount = Infinity;
+    for (let i = 0; i < TRAIT_LAYERS.length; i++) {
+      const have = loadedPool[i].length + pending[i];
+      if (have >= POOL_TARGET || queue[i].length === 0 || failed[i] >= MAX_FAILURES) continue;
+      if (have < bestCount) { best = i; bestCount = have; }
+    }
+    return best;
   }
 
-  function tallyCompleted(i) {
-    layerCompleted[i]++;
-    if (layerCompleted[i] === layerSources[i].length && loadedPool[i].length === 0) {
-      activatePlaceholder(i);
+  function pump() {
+    if (document.hidden) return;                     // resume on visibilitychange
+    while (inFlight < CONCURRENCY) {
+      const i = nextJob();
+      if (i < 0) return;
+      const url = queue[i].shift();
+      inFlight++; pending[i]++;
+      const im = new Image();
+      im.decoding = "async";
+      im.onload = () => {
+        // Decode off the main thread, then the swap is instant and jank-free
+        const ready = im.decode ? im.decode().catch(() => {}) : Promise.resolve();
+        ready.then(() => {
+          inFlight--; pending[i]--; failed[i] = 0;
+          loadedPool[i].push(url);
+          if (loadedPool[i].length === 1) layerImgs[i].src = url;
+          pump();
+        });
+      };
+      im.onerror = () => {
+        inFlight--; pending[i]--; failed[i]++;
+        const givenUp = queue[i].length === 0 || failed[i] >= MAX_FAILURES;
+        if (givenUp && loadedPool[i].length === 0) activatePlaceholder(i);
+        pump();
+      };
+      im.src = url;
     }
   }
 
-  layerSources.forEach((urls, i) => {
-    const shuffled = [...urls].sort(() => Math.random() - 0.5);
-    shuffled.slice(0, FIRST_WAVE).forEach(url => loadImage(url, i));   // priority
-    setTimeout(() => {
-      shuffled.slice(FIRST_WAVE).forEach(url => loadImage(url, i));    // background
-    }, 2000);
-  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) pump(); });
+  pump();
 
   /* ---------- randomize loop — staggered so one face morphs into the next ---------- */
   const STAGGER_MS = INTERVAL_MS / layerImgs.length;
   layerImgs.forEach((img, i) => {
     const tick = () => {
+      if (document.hidden) return;                   // nothing to animate for nobody
       const pool = loadedPool[i];
       if (pool.length < 2) return;
       let next = img.src;
